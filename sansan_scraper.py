@@ -31,6 +31,7 @@ SALES_RANGES: List[Tuple[str, str]] = [
 ]
 
 COLUMNS = [
+    "会社名",
     "名刺所有枚数",
     "最終名刺交換日",
     "役員・管理職",
@@ -455,6 +456,7 @@ def parse_page_rows(driver, By, logger: logging.Logger) -> List[Dict[str, str]]:
                 pass
             data.append(
                 {
+                    "会社名": safe_text(row, "company-name-label"),
                     "_company_name": safe_text(row, "company-name-label"),
                     "名刺所有枚数": safe_text(row, "number-of-bizcards"),
                     "最終名刺交換日": safe_text(row, "last-bizcard-exchanged-at"),
