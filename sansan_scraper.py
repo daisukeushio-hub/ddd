@@ -25,10 +25,36 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 JST = timezone.utc
 
 SALES_RANGES: List[Tuple[str, str]] = [
+    ("5,000万", "1億"),
+    ("1億", "3億"),
+    ("3億", "5億"),
+    ("5億", "10億"),
     ("10億", "30億"),
     ("30億", "50億"),
     ("50億", "100億"),
+    ("100億", "300億"),
+    ("300億", "500億"),
+    ("500億", "1,000億"),
+    ("1,000億", "3,000億"),
+    ("3,000億", "5,000億"),
+    ("5,000億", "1兆"),
 ]
+
+SALES_RANGE_CHOICES = {
+    "5000man-1oku": ("5,000万", "1億"),
+    "1oku-3oku": ("1億", "3億"),
+    "3oku-5oku": ("3億", "5億"),
+    "5oku-10oku": ("5億", "10億"),
+    "10-30": ("10億", "30億"),
+    "30-50": ("30億", "50億"),
+    "50-100": ("50億", "100億"),
+    "100-300": ("100億", "300億"),
+    "300-500": ("300億", "500億"),
+    "500-1000": ("500億", "1,000億"),
+    "1000-3000": ("1,000億", "3,000億"),
+    "3000-5000": ("3,000億", "5,000億"),
+    "5000-1cho": ("5,000億", "1兆"),
+}
 
 COLUMNS = [
     "会社名",
@@ -248,6 +274,13 @@ def build_condition_id(sales_from: str, sales_to: str, industry: Dict[str, str])
     if industry.get("小分類"):
         parts.append(industry["小分類"])
     return f"{sales_from}-{sales_to}|{'>'.join(parts)}"
+
+
+def selected_sales_indexes(args: argparse.Namespace) -> List[int]:
+    if not args.sales_range:
+        return list(range(len(SALES_RANGES)))
+    target = SALES_RANGE_CHOICES[args.sales_range]
+    return [i for i, pair in enumerate(SALES_RANGES) if pair == target]
 
 
 def select_custom_dropdown(driver, wait, By, EC, category_text: str, option_text: str) -> None:
@@ -504,6 +537,8 @@ def run(args: argparse.Namespace) -> int:
     logger = setup_logger(log_path, args.verbose)
     industries = load_industries(Path(args.industries_csv))
     logger.info("industries loaded: %s", len(industries))
+    allowed_sales_indexes = set(selected_sales_indexes(args))
+    logger.info("sales ranges selected: %s", [SALES_RANGES[i] for i in sorted(allowed_sales_indexes)])
 
     state_store = StateStore(state_path)
     dedupe_store = DedupeStore(db_path)
@@ -549,6 +584,8 @@ def run(args: argparse.Namespace) -> int:
 
         condition_count = 0
         for si, (sales_from, sales_to) in enumerate(SALES_RANGES):
+            if si not in allowed_sales_indexes:
+                continue
             if si < start_cursor.sales_index:
                 continue
             for ii, industry in enumerate(industries):
@@ -569,6 +606,8 @@ def run(args: argparse.Namespace) -> int:
                     try:
                         driver.get("https://ap.sansan.com/v/companies/")
                         wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                        before_sig = row_signature(driver, By)
+                        before_label = pager_label(driver, By)
 
                         sales_from_el = wait.until(
                         lambda d: find_first(
@@ -604,7 +643,12 @@ def run(args: argparse.Namespace) -> int:
 
                         search_button = wait.until(EC.element_to_be_clickable((By.ID, "button-detail-search")))
                         driver.execute_script("arguments[0].click();", search_button)
-                        time.sleep(1)
+                        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                        changed = WebDriverWait(driver, args.short_timeout_sec + 5).until(
+                            lambda d: row_signature(d, By) != before_sig or pager_label(d, By) != before_label
+                        )
+                        if not changed:
+                            raise RuntimeError("search results did not change after submitting filters")
                     except Exception:
                         logger.warning(
                             "search page inspect url=%s title=%s iframes=%s",
@@ -711,6 +755,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--max-conditions", type=int, default=0)
+    p.add_argument("--sales-range", choices=sorted(SALES_RANGE_CHOICES.keys()), default="")
     p.add_argument("--timeout-sec", type=int, default=20)
     p.add_argument("--short-timeout-sec", type=int, default=3)
     p.add_argument("--retries", type=int, default=3)
