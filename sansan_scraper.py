@@ -15,6 +15,7 @@ import sqlite3
 import sys
 import time
 import unicodedata
+from urllib.parse import urljoin
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,25 +31,29 @@ SALES_RANGES: List[Tuple[str, str]] = [
 ]
 
 COLUMNS = [
-    "企業名",
+    "名刺所有枚数",
+    "最終名刺交換日",
+    "役員・管理職",
     "URL",
-    "最新期業績売上高",
     "郵便番号",
     "住所",
     "電話番号",
-    "代表者肩書",
-    "代表者名",
-    "主業",
-    "産業分類（大分類）",
-    "産業分類（中分類）",
-    "産業分類（小分類）",
+    "代表者の役職名",
+    "代表者の氏名",
+    "主業：大分類",
+    "主業：中分類",
+    "従業：大分類",
+    "従業：中分類",
     "従業員数",
-    "資本金",
-    "最新決算期",
-    "従業",
-    "従業（大分類）",
-    "従業（中分類）",
-    "従業（小分類）",
+    "資本金（円）",
+    "売上高（円）",
+    "決算年月",
+    "創業年月",
+    "設立年月",
+    "株式公開区分",
+    "法人番号",
+    "会社キーワード",
+    "会社メモ",
     "取得日時",
     "検索条件ID",
     "取得ページ番号",
@@ -138,7 +143,7 @@ class CsvSink:
             return
         write_header = not self.path.exists()
         with self.path.open("a", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=COLUMNS)
+            writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
             if write_header:
                 writer.writeheader()
             writer.writerows(rows)
@@ -161,19 +166,46 @@ def make_dedupe_key(company_name: str, address: str) -> str:
 
 
 def load_industries(path: Path) -> List[Dict[str, str]]:
-    with path.open("r", encoding="utf-8", newline="") as f:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        expected = {"大分類", "中分類", "小分類"}
+        expected = {"大分類", "中分類"}
         if not reader.fieldnames or not expected.issubset(set(reader.fieldnames)):
-            raise ValueError("industries.csv のヘッダーは 大分類,中分類,小分類 が必要です")
-        return [
-            {
-                "大分類": (row.get("大分類") or "").strip(),
-                "中分類": (row.get("中分類") or "").strip(),
-                "小分類": (row.get("小分類") or "").strip(),
-            }
-            for row in reader
-        ]
+            raise ValueError("industries.csv のヘッダーは 大分類,中分類 が必要です")
+        rows = []
+        for row in reader:
+            major = (row.get("大分類") or "").strip()
+            middle = (row.get("中分類") or "").strip()
+            minor = (row.get("小分類") or "").strip()
+            if not major and not middle:
+                continue
+            rows.append({"大分類": major, "中分類": middle, "小分類": minor})
+        return rows
+
+
+def dump_debug_artifacts(driver, label: str, logger: logging.Logger) -> None:
+    debug_dir = Path("debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    html_path = debug_dir / f"{label}_{stamp}.html"
+    png_path = debug_dir / f"{label}_{stamp}.png"
+    try:
+        html_path.write_text(driver.page_source, encoding="utf-8")
+        logger.info("debug html saved: %s", html_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to save debug html: %s", exc)
+    try:
+        driver.save_screenshot(str(png_path))
+        logger.info("debug screenshot saved: %s", png_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to save debug screenshot: %s", exc)
+
+
+def find_first(driver, by: str, selectors: Iterable[str]):
+    for selector in selectors:
+        elements = driver.find_elements(by, selector)
+        if elements:
+            return elements[0]
+    return None
 
 
 def retry_call(func, retries: int, logger: logging.Logger, label: str):
@@ -211,7 +243,10 @@ def setup_logger(log_path: Path, verbose: bool) -> logging.Logger:
 
 
 def build_condition_id(sales_from: str, sales_to: str, industry: Dict[str, str]) -> str:
-    return f"{sales_from}-{sales_to}|{industry['大分類']}>{industry['中分類']}>{industry['小分類']}"
+    parts = [industry["大分類"], industry["中分類"]]
+    if industry.get("小分類"):
+        parts.append(industry["小分類"])
+    return f"{sales_from}-{sales_to}|{'>'.join(parts)}"
 
 
 def select_custom_dropdown(driver, wait, By, EC, category_text: str, option_text: str) -> None:
@@ -228,13 +263,186 @@ def select_custom_dropdown(driver, wait, By, EC, category_text: str, option_text
     result_option.click()
 
 
+def select_option_by_text(driver, wait, By, css_selector: str, option_text: str) -> None:
+    def find_select():
+        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+            options = element.find_elements(By.TAG_NAME, "option")
+            for option in options:
+                if option.text.strip() == option_text:
+                    return element, option.get_attribute("value")
+        return None
+
+    result = find_select()
+    if result is not None:
+        element, value = result
+        driver.execute_script(
+            """
+            const select = arguments[0];
+            const value = arguments[1];
+            select.value = value;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            """,
+            element,
+            value,
+        )
+        return
+
+    select_element = wait.until(lambda d: d.find_element(By.CSS_SELECTOR, css_selector))
+    select2_container = select_element.find_element(By.XPATH, "./following-sibling::span[contains(@class, 'select2')][1]")
+    wait.until(lambda d: select2_container.is_displayed() and select2_container.is_enabled())
+    select2_container.click()
+
+    search_box = wait.until(lambda d: d.find_element(By.CLASS_NAME, "select2-search__field"))
+    search_box.clear()
+    search_box.send_keys(option_text)
+
+    result_option_xpath = (
+        f"//li[contains(@class, 'select2-results__option') and normalize-space()='{option_text}']"
+    )
+    result_option = wait.until(lambda d: d.find_element(By.XPATH, result_option_xpath))
+    result_option.click()
+
+
+def row_signature(driver, By) -> Optional[str]:
+    rows = driver.find_elements(By.CLASS_NAME, "search-result-list-table-data-row")
+    if not rows:
+        return None
+    return rows[0].get_attribute("data-latest-soc") or rows[0].text
+
+
+def pager_label(driver, By) -> str:
+    try:
+        return driver.find_element(By.CSS_SELECTOR, "ul.search-result-page-nav button.dropdown-toggle").text.strip()
+    except Exception:
+        return ""
+
+
+def fetch_next_page_via_xhr(driver, href: str):
+    script = """
+    const href = arguments[0];
+    const done = arguments[arguments.length - 1];
+    const token =
+      document.querySelector('#company-index input[name="__RequestVerificationToken"]') ||
+      document.querySelector('input[name="__RequestVerificationToken"]');
+
+    fetch(href, {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        'X-Requested-With': 'XMLHttpRequest',
+        ...(token ? { 'RequestVerificationToken': token.value } : {})
+      }
+    }).then(async (resp) => {
+      const text = await resp.text();
+      done({ ok: resp.ok, status: resp.status, text });
+    }).catch((err) => {
+      done({ ok: false, status: 0, error: String(err) });
+    });
+    """
+    return driver.execute_async_script(script, href)
+
+
+def goto_next_page(driver, wait, By, logger: logging.Logger) -> bool:
+    next_buttons = driver.find_elements(By.CSS_SELECTOR, "a.btn-next-page")
+    if not next_buttons:
+        logger.info("next page button not found url=%s", driver.current_url)
+        return False
+    next_button = next_buttons[0]
+    href = next_button.get_attribute("href")
+    if not href:
+        logger.info("next page href missing url=%s", driver.current_url)
+        return False
+
+    current_sig = row_signature(driver, By)
+    current_url = driver.current_url
+    current_label = pager_label(driver, By)
+    logger.info(
+        "attempt next page current_url=%s next_href=%s current_sig=%s current_label=%s",
+        current_url,
+        href,
+        current_sig,
+        current_label,
+    )
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_button)
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+            el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+            el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+            el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+            """,
+            next_button,
+        )
+        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+        wait.until(
+            lambda d: row_signature(d, By) not in (None, current_sig) or pager_label(d, By) != current_label
+        )
+        logger.info(
+            "next page moved by event url=%s new_sig=%s new_label=%s",
+            driver.current_url,
+            row_signature(driver, By),
+            pager_label(driver, By),
+        )
+        return True
+    except Exception as click_exc:  # noqa: BLE001
+        logger.warning("next page click failed: %s", click_exc)
+
+    xhr_result = fetch_next_page_via_xhr(driver, href)
+    logger.info("next page xhr result status=%s ok=%s", xhr_result.get("status"), xhr_result.get("ok"))
+
+    if xhr_result.get("ok") and xhr_result.get("text"):
+        driver.execute_script(
+            """
+            const html = arguments[0];
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+
+            const currentResult = document.querySelector('#company-index-search-result-list');
+            const nextResult = doc.querySelector('#company-index-search-result-list');
+            if (currentResult && nextResult) {
+              currentResult.replaceWith(nextResult);
+            }
+
+            const currentPager = document.querySelector('ul.search-result-page-nav');
+            const pagers = doc.querySelectorAll('ul.search-result-page-nav');
+            const nextPager = pagers.length ? pagers[pagers.length - 1] : null;
+            if (currentPager && nextPager) {
+              currentPager.replaceWith(nextPager);
+            }
+            """,
+            xhr_result["text"],
+        )
+        wait.until(
+            lambda d: row_signature(d, By) not in (None, current_sig) or pager_label(d, By) != current_label
+        )
+        logger.info(
+            "next page moved by xhr swap url=%s new_sig=%s new_label=%s",
+            driver.current_url,
+            row_signature(driver, By),
+            pager_label(driver, By),
+        )
+        return True
+
+    dump_debug_artifacts(driver, "next_page_failure", logger)
+    raise RuntimeError(f"failed to move to next page href={href}") from click_exc
+
+
 def parse_page_rows(driver, By, logger: logging.Logger) -> List[Dict[str, str]]:
     rows = driver.find_elements(By.CLASS_NAME, "search-result-list-table-data-row")
     data: List[Dict[str, str]] = []
 
     def safe_text(row, class_name: str) -> str:
         try:
-            return row.find_element(By.CLASS_NAME, class_name).text
+            cell = row.find_element(By.CLASS_NAME, class_name)
+            tooltip_nodes = cell.find_elements(By.CSS_SELECTOR, "[title]")
+            if tooltip_nodes:
+                title = tooltip_nodes[0].get_attribute("title")
+                if title is not None:
+                    return title.strip()
+            return cell.text.strip()
         except Exception:
             return ""
 
@@ -247,25 +455,30 @@ def parse_page_rows(driver, By, logger: logging.Logger) -> List[Dict[str, str]]:
                 pass
             data.append(
                 {
-                    "企業名": safe_text(row, "company-name-label"),
+                    "_company_name": safe_text(row, "company-name-label"),
+                    "名刺所有枚数": safe_text(row, "number-of-bizcards"),
+                    "最終名刺交換日": safe_text(row, "last-bizcard-exchanged-at"),
+                    "役員・管理職": safe_text(row, "officer-and-manager"),
                     "URL": url,
-                    "最新期業績売上高": safe_text(row, "latest-sales-accounting-term-sales"),
                     "郵便番号": safe_text(row, "postal-code"),
                     "住所": safe_text(row, "location"),
                     "電話番号": safe_text(row, "phone-number"),
-                    "代表者肩書": safe_text(row, "representative-title"),
-                    "代表者名": safe_text(row, "representative-name"),
-                    "主業": safe_text(row, "tdb-main-industrial-classification-section"),
-                    "産業分類（大分類）": safe_text(row, "tdb-main-industrial-classification-division"),
-                    "産業分類（中分類）": safe_text(row, "tdb-main-industrial-classification-group"),
-                    "産業分類（小分類）": safe_text(row, "tdb-main-industrial-classification-class"),
+                    "代表者の役職名": safe_text(row, "representative-title"),
+                    "代表者の氏名": safe_text(row, "representative-name"),
+                    "主業：大分類": safe_text(row, "sansan-industrial-classification-1-division"),
+                    "主業：中分類": safe_text(row, "sansan-industrial-classification-1-major-group"),
+                    "従業：大分類": safe_text(row, "sansan-industrial-classification-2-division"),
+                    "従業：中分類": safe_text(row, "sansan-industrial-classification-2-major-group"),
                     "従業員数": safe_text(row, "employee-number"),
-                    "資本金": safe_text(row, "legal-capital"),
-                    "最新決算期": safe_text(row, "latest-sales-accounting-term"),
-                    "従業": safe_text(row, "tdb-sub-industrial-classification-section"),
-                    "従業（大分類）": safe_text(row, "tdb-sub-industrial-classification-division"),
-                    "従業（中分類）": safe_text(row, "tdb-sub-industrial-classification-group"),
-                    "従業（小分類）": safe_text(row, "tdb-sub-industrial-classification-class"),
+                    "資本金（円）": safe_text(row, "legal-capital"),
+                    "売上高（円）": safe_text(row, "latest-sales-accounting-term-sales"),
+                    "決算年月": safe_text(row, "latest-sales-accounting-term"),
+                    "創業年月": safe_text(row, "established-at"),
+                    "設立年月": safe_text(row, "created-at"),
+                    "株式公開区分": safe_text(row, "public-offering"),
+                    "法人番号": safe_text(row, "corporate-number"),
+                    "会社キーワード": safe_text(row, "company-keyword"),
+                    "会社メモ": safe_text(row, "company-memo"),
                 }
             )
         except Exception as e:  # noqa: BLE001
@@ -351,25 +564,61 @@ def run(args: argparse.Namespace) -> int:
                 logger.info("condition start: %s page=%s", condition_id, page)
 
                 def open_and_search():
-                    driver.get("https://ap.sansan.com/v/companies/")
-                    Select(driver.find_element(By.ID, "SearchInput_LatestSalesAccountingTermSalesFrom")).select_by_visible_text(sales_from)
-                    Select(driver.find_element(By.ID, "SearchInput_LatestSalesAccountingTermSalesTo")).select_by_visible_text(sales_to)
+                    try:
+                        driver.get("https://ap.sansan.com/v/companies/")
+                        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
 
-                    select_custom_dropdown(driver, wait, By, EC, "大分類", industry["大分類"])
-                    select_custom_dropdown(driver, wait, By, EC, "中分類", industry["中分類"])
-                    select_custom_dropdown(driver, wait, By, EC, "小分類", industry["小分類"])
+                        sales_from_el = wait.until(
+                        lambda d: find_first(
+                            d,
+                            By.CSS_SELECTOR,
+                            [
+                                "#SearchInput_LatestSalesAccountingTermSalesFrom",
+                                "select[id*='LatestSalesAccountingTermSalesFrom']",
+                                "select[name*='LatestSalesAccountingTermSalesFrom']",
+                            ],
+                        )
+                        )
+                        sales_to_el = wait.until(
+                        lambda d: find_first(
+                            d,
+                            By.CSS_SELECTOR,
+                            [
+                                "#SearchInput_LatestSalesAccountingTermSalesTo",
+                                "select[id*='LatestSalesAccountingTermSalesTo']",
+                                "select[name*='LatestSalesAccountingTermSalesTo']",
+                            ],
+                        )
+                        )
 
-                    old_html = driver.find_element(By.TAG_NAME, "html")
-                    driver.find_element(By.ID, "button-detail-search").click()
-                    wait.until(EC.staleness_of(old_html))
+                        if sales_from_el is None or sales_to_el is None:
+                            raise RuntimeError("sales fields not found")
+
+                        Select(sales_from_el).select_by_visible_text(sales_from)
+                        Select(sales_to_el).select_by_visible_text(sales_to)
+
+                        select_option_by_text(driver, wait, By, "select[data-is-division='True']", industry["大分類"])
+                        select_option_by_text(driver, wait, By, "select[data-is-major-group='True']", industry["中分類"])
+
+                        search_button = wait.until(EC.element_to_be_clickable((By.ID, "button-detail-search")))
+                        driver.execute_script("arguments[0].click();", search_button)
+                        time.sleep(1)
+                    except Exception:
+                        logger.warning(
+                            "search page inspect url=%s title=%s iframes=%s",
+                            driver.current_url,
+                            driver.title,
+                            len(driver.find_elements(By.TAG_NAME, "iframe")),
+                        )
+                        dump_debug_artifacts(driver, "search_setup_failure", logger)
+                        raise
 
                 retry_call(open_and_search, args.retries, logger, "search setup")
 
                 for p in range(1, page):
                     try:
-                        old_html = driver.find_element(By.TAG_NAME, "html")
-                        driver.find_element(By.CLASS_NAME, "btn-next-page").click()
-                        wait.until(EC.staleness_of(old_html))
+                        if not goto_next_page(driver, wait, By, logger):
+                            raise RuntimeError("next page not found while fast-forwarding")
                     except Exception as e:  # noqa: BLE001
                         logger.error("resume fast-forward failed at page=%s: %s", p, e)
                         break
@@ -379,6 +628,9 @@ def run(args: argparse.Namespace) -> int:
                     try:
                         wait.until(EC.presence_of_element_located((By.CLASS_NAME, "search-result-list-table-data-row")))
                     except TimeoutException:
+                        if page > 1:
+                            logger.warning("no rows after pagination url=%s page=%s", driver.current_url, page)
+                            dump_debug_artifacts(driver, f"pagination_no_rows_page_{page}", logger)
                         logger.info("no rows at condition=%s page=%s", condition_id, page)
                         break
 
@@ -387,7 +639,7 @@ def run(args: argparse.Namespace) -> int:
 
                     new_rows: List[Dict[str, Any]] = []
                     for row in raw_rows:
-                        name = row.get("企業名", "")
+                        name = row.get("_company_name", "")
                         address = row.get("住所", "")
                         key = make_dedupe_key(name, address)
                         if dedupe_store.seen(key):
@@ -402,7 +654,7 @@ def run(args: argparse.Namespace) -> int:
                     sink.append_rows(new_rows)
                     for row in new_rows:
                         dedupe_store.insert(
-                            row["重複判定キー"], row["企業名"], row["住所"], row["検索条件ID"], int(row["取得ページ番号"])
+                            row["重複判定キー"], row["_company_name"], row["住所"], row["検索条件ID"], int(row["取得ページ番号"])
                         )
                     state["stats"]["rows_written"] += len(new_rows)
                     logger.info(
@@ -416,14 +668,14 @@ def run(args: argparse.Namespace) -> int:
                     state_store.save(state)
 
                     try:
-                        old_html = driver.find_element(By.TAG_NAME, "html")
-                        next_btn = WebDriverWait(driver, args.short_timeout_sec).until(
-                            EC.element_to_be_clickable((By.CLASS_NAME, "btn-next-page"))
-                        )
-                        driver.execute_script("arguments[0].click();", next_btn)
-                        wait.until(EC.staleness_of(old_html))
+                        if not goto_next_page(driver, WebDriverWait(driver, args.short_timeout_sec), By, logger):
+                            break
                         page += 1
                     except TimeoutException:
+                        logger.info("next page timeout at condition=%s page=%s url=%s", condition_id, page, driver.current_url)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("next page transition failed at condition=%s page=%s: %s", condition_id, page, e)
                         break
 
                 state["stats"]["conditions_done"] += 1
