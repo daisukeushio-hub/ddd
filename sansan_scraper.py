@@ -56,6 +56,19 @@ SALES_RANGE_CHOICES = {
     "5000-1cho": ("5,000億", "1兆"),
 }
 
+INDUSTRY_OPTION_OVERRIDES = {
+    ("select[data-is-major-group='True']", "廃棄物処理"): "R01",
+    ("select[data-is-major-group='True']", "自動車整備"): "R02",
+    ("select[data-is-major-group='True']", "機械等修理"): "R03",
+    ("select[data-is-major-group='True']", "人材サービス"): "R04",
+    ("select[data-is-major-group='True']", "警備"): "R05",
+    ("select[data-is-major-group='True']", "業務請負、アウトソーシング"): "R06",
+    ("select[data-is-major-group='True']", "物品賃貸"): "R07",
+    ("select[data-is-major-group='True']", "郵便局"): "R08",
+    ("select[data-is-major-group='True']", "協同組合"): "R09",
+    ("select[data-is-major-group='True']", "その他の事業サービス"): "R98",
+}
+
 COLUMNS = [
     "会社名",
     "名刺所有枚数",
@@ -298,6 +311,240 @@ def select_custom_dropdown(driver, wait, By, EC, category_text: str, option_text
 
 
 def select_option_by_text(driver, wait, By, css_selector: str, option_text: str) -> None:
+    def has_selected_option_text() -> bool:
+        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+            try:
+                selected = element.find_elements(By.CSS_SELECTOR, "option:checked")
+                for option in selected:
+                    if option.text.strip() == option_text:
+                        return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def has_selected_value() -> bool:
+        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+            try:
+                value = (element.get_attribute("value") or "").strip()
+                if value:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def apply_override() -> bool:
+        override_value = INDUSTRY_OPTION_OVERRIDES.get((css_selector, option_text))
+        if not override_value:
+            return False
+        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+            try:
+                driver.execute_script(
+                    """
+                    const select = arguments[0];
+                    const value = arguments[1];
+                    const text = arguments[2];
+                    let option = Array.from(select.options).find((opt) => opt.value === value);
+                    if (!option) {
+                      option = new Option(text, value, true, true);
+                      select.add(option);
+                    } else {
+                      option.selected = true;
+                    }
+                    select.value = value;
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                    """,
+                    element,
+                    override_value,
+                    option_text,
+                )
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def select_via_ajax() -> bool:
+        script = r"""
+const cssSelector = arguments[0];
+const optionText = arguments[1];
+const done = arguments[arguments.length - 1];
+
+const select = document.querySelector(cssSelector);
+if (!select) {
+  done({ok: false, reason: "select not found"});
+  return;
+}
+
+const dataUrl = select.getAttribute("data-url");
+if (!dataUrl) {
+  done({ok: false, reason: "data-url not found"});
+  return;
+}
+
+const targetText = optionText.trim();
+const root = select.closest('.sansan-industrial-classification-input-area');
+const divisionSelect = root ? root.querySelector("select[data-is-division='True']") : null;
+const ancestorValue = (divisionSelect && divisionSelect.value) || "";
+
+const queryBases = [
+  { q: targetText, term: targetText },
+  { q: targetText },
+  { term: targetText },
+  { text: targetText },
+  { keyword: targetText }
+];
+
+function collectCandidates(payload, bucket) {
+  if (!payload) return;
+  if (Array.isArray(payload)) {
+    for (const item of payload) collectCandidates(item, bucket);
+    return;
+  }
+  if (typeof payload !== "object") return;
+
+  const text = payload.text ?? payload.label ?? payload.name ?? payload.title ?? "";
+  const value = payload.id ?? payload.value ?? payload.key ?? payload.code ?? "";
+  if (text || value) {
+    bucket.push({ text: String(text).trim(), value: String(value).trim() });
+  }
+  for (const value of Object.values(payload)) {
+    if (value && typeof value === "object") collectCandidates(value, bucket);
+  }
+}
+
+function applyOption(value, text) {
+  let option = Array.from(select.options).find((opt) => opt.value === value);
+  if (!option) {
+    option = new Option(text, value, true, true);
+    select.add(option);
+  } else {
+    option.selected = true;
+  }
+  select.value = value;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  done({ok: true, value, text});
+}
+
+(async () => {
+  for (const baseQuery of queryBases) {
+    const url = new URL(dataUrl, location.origin);
+    const query = { ...baseQuery };
+    if (ancestorValue && select.getAttribute('data-is-major-group') === 'True') {
+      query.ancestor = ancestorValue;
+      query.ancestorCode = ancestorValue;
+      query.ancestorId = ancestorValue;
+      query.parent = ancestorValue;
+      query.parentValue = ancestorValue;
+      query.code = ancestorValue;
+    }
+    for (const [key, value] of Object.entries(query)) {
+      url.searchParams.set(key, value);
+    }
+    try {
+      const response = await fetch(url.toString(), {
+        credentials: "same-origin",
+        headers: { "X-Requested-With": "XMLHttpRequest" }
+      });
+      if (!response.ok) continue;
+      const payload = await response.json();
+      const candidates = [];
+      collectCandidates(payload, candidates);
+      const match = candidates.find((item) => item.text === targetText) ||
+        candidates.find((item) => item.text.includes(targetText));
+      if (match && match.value) {
+        applyOption(match.value, match.text || targetText);
+        return;
+      }
+    } catch (error) {
+      // try next query shape
+    }
+  }
+  done({ok: false, reason: "ajax option not found", targetText});
+})();
+"""
+        result = driver.execute_async_script(script, css_selector, option_text)
+        return bool(result and result.get("ok"))
+
+    def select_via_modal() -> bool:
+        script = r"""
+const cssSelector = arguments[0];
+const optionText = arguments[1];
+const done = arguments[arguments.length - 1];
+
+const select = document.querySelector(cssSelector);
+const targetLink = document.querySelector('#sansan-industrial-classification-conditions .target-list');
+if (!select || !targetLink) {
+  done({ok: false, reason: 'modal source not found'});
+  return;
+}
+
+const remoteUrl = targetLink.getAttribute('data-remote');
+if (!remoteUrl) {
+  done({ok: false, reason: 'modal remote url not found'});
+  return;
+}
+
+function findCodeAround(node) {
+  let current = node;
+  for (let i = 0; i < 5 && current; i += 1) {
+    const input = current.querySelector?.('input[type="checkbox"], input[type="radio"], input[type="hidden"]');
+    if (input) {
+      return input.value || input.getAttribute('data-value') || input.getAttribute('data-code') || '';
+    }
+    current = current.parentElement;
+  }
+  return '';
+}
+
+(async () => {
+  try {
+    const response = await fetch(new URL(remoteUrl, location.origin).toString(), {
+      credentials: 'same-origin',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    });
+    if (!response.ok) {
+      done({ok: false, reason: 'modal fetch failed'});
+      return;
+    }
+    const html = await response.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const candidates = Array.from(doc.querySelectorAll('label, span, a, li, div'));
+    const exact = candidates.find((node) => node.textContent && node.textContent.trim() === optionText.trim());
+    const partial = candidates.find((node) => node.textContent && node.textContent.includes(optionText.trim()));
+    const matchNode = exact || partial;
+    if (!matchNode) {
+      done({ok: false, reason: 'modal text not found'});
+      return;
+    }
+    const code = findCodeAround(matchNode);
+    if (!code) {
+      done({ok: false, reason: 'modal code not found'});
+      return;
+    }
+
+    let option = Array.from(select.options).find((opt) => opt.value === code);
+    if (!option) {
+      option = new Option(optionText, code, true, true);
+      select.add(option);
+    } else {
+      option.selected = true;
+    }
+    select.value = code;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+
+    const root = select.closest('.sansan-industrial-classification-input-area');
+    const hidden = root ? root.querySelector('input[data-input-sicc]') : null;
+    if (hidden) {
+      hidden.value = code;
+    }
+    done({ok: true, code});
+  } catch (error) {
+    done({ok: false, reason: String(error)});
+  }
+})();
+"""
+        result = driver.execute_async_script(script, css_selector, option_text)
+        return bool(result and result.get("ok"))
+
     def find_select():
         for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
             options = element.find_elements(By.TAG_NAME, "option")
@@ -306,49 +553,151 @@ def select_option_by_text(driver, wait, By, css_selector: str, option_text: str)
                     return element, option.get_attribute("value")
         return None
 
-    result = find_select()
-    if result is not None:
-        element, value = result
-        driver.execute_script(
-            """
-            const select = arguments[0];
-            const value = arguments[1];
-            select.value = value;
-            select.dispatchEvent(new Event('change', { bubbles: true }));
-            """,
-            element,
-            value,
-        )
-        return
+    def find_visible_select():
+        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+            try:
+                container = element.find_element(
+                    By.XPATH,
+                    "./following-sibling::span[contains(@class, 'select2')][1]",
+                )
+                if container.is_displayed():
+                    return element
+            except Exception:  # noqa: BLE001
+                continue
+        return None
 
-    select_element = wait.until(lambda d: d.find_element(By.CSS_SELECTOR, css_selector))
-    select2_container = select_element.find_element(By.XPATH, "./following-sibling::span[contains(@class, 'select2')][1]")
-    wait.until(lambda d: select2_container.is_displayed() and select2_container.is_enabled())
-    select2_container.click()
+    last_error = None
+    for _ in range(3):
+        try:
+            if apply_override():
+                return
+            result = find_select()
+            if result is not None:
+                element, value = result
+                driver.execute_script(
+                    """
+                    const select = arguments[0];
+                    const value = arguments[1];
+                    select.value = value;
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                    """,
+                    element,
+                    value,
+                )
+                return
 
-    search_box = wait.until(lambda d: d.find_element(By.CLASS_NAME, "select2-search__field"))
-    search_box.clear()
-    search_box.send_keys(option_text)
+            select_element = wait.until(lambda d: find_visible_select())
+            opened = driver.execute_script(
+                """
+                const select = arguments[0];
+                if (window.jQuery) {
+                    const $select = window.jQuery(select);
+                    if ($select.data('select2')) {
+                        $select.select2('open');
+                        return true;
+                    }
+                }
+                return false;
+                """,
+                select_element,
+            )
+            if not opened:
+                select2_container = select_element.find_element(
+                    By.XPATH,
+                    "./following-sibling::span[contains(@class, 'select2')][1]",
+                )
+                driver.execute_script("arguments[0].click();", select2_container)
 
-    result_option_xpath = (
-        f"//li[contains(@class, 'select2-results__option') and normalize-space()='{option_text}']"
-    )
-    result_option = wait.until(lambda d: d.find_element(By.XPATH, result_option_xpath))
-    result_option.click()
+            search_box = wait.until(lambda d: d.find_element(By.CLASS_NAME, "select2-search__field"))
+            search_box.clear()
+            search_box.send_keys(option_text)
+            time.sleep(0.5)
+            search_box.send_keys("\ue007")
+
+            try:
+                wait.until(
+                    lambda d: has_selected_option_text() or has_selected_value() or find_select() is not None
+                )
+                return
+            except Exception:
+                result_option_xpath = (
+                    f"//li[contains(@class, 'select2-results__option') and contains(normalize-space(), '{option_text}')]"
+                )
+                result_option = wait.until(lambda d: d.find_element(By.XPATH, result_option_xpath))
+                driver.execute_script("arguments[0].click();", result_option)
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            try:
+                if select_via_ajax():
+                    return
+            except Exception as ajax_exc:  # noqa: BLE001
+                last_error = ajax_exc
+            try:
+                if select_via_modal():
+                    return
+            except Exception as modal_exc:  # noqa: BLE001
+                last_error = modal_exc
+            time.sleep(0.5)
+
+    raise RuntimeError(f"failed to select option '{option_text}' for selector '{css_selector}': {last_error}")
 
 
 def row_signature(driver, By) -> Optional[str]:
-    rows = driver.find_elements(By.CLASS_NAME, "search-result-list-table-data-row")
-    if not rows:
+    try:
+        rows = driver.find_elements(By.CLASS_NAME, "search-result-list-table-data-row")
+        if not rows:
+            return None
+        try:
+            return rows[0].get_attribute("data-latest-soc") or rows[0].text
+        except Exception:
+            return None
+    except Exception:
         return None
-    return rows[0].get_attribute("data-latest-soc") or rows[0].text
 
 
 def pager_label(driver, By) -> str:
     try:
-        return driver.find_element(By.CSS_SELECTOR, "ul.search-result-page-nav button.dropdown-toggle").text.strip()
+        element = driver.find_element(By.CSS_SELECTOR, "ul.search-result-page-nav button.dropdown-toggle")
+        return element.text.strip()
     except Exception:
         return ""
+
+
+def reset_industry_conditions(driver) -> None:
+    driver.execute_script(
+        """
+        const root = document.querySelector('#sansan-industrial-classification-conditions');
+        if (!root) {
+          return;
+        }
+        const hiddenInputs = root.querySelectorAll('input[data-input-sicc]');
+        hiddenInputs.forEach((input) => {
+          input.value = '';
+        });
+        const selects = root.querySelectorAll("select[data-is-division='True'], select[data-is-major-group='True']");
+        selects.forEach((select) => {
+          select.innerHTML = '<option value=""></option>';
+          select.value = '';
+          select.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        root.querySelectorAll('.select2-selection__rendered').forEach((rendered) => {
+          const select = rendered.closest('span')?.querySelector("select[data-is-division='True'], select[data-is-major-group='True']");
+          if (!select) {
+            rendered.textContent = '';
+            return;
+          }
+          rendered.textContent = select.getAttribute('data-placeholder') || '';
+          rendered.removeAttribute('title');
+        });
+        document.querySelectorAll('.select2-container--open').forEach((node) => {
+          node.classList.remove('select2-container--open');
+        });
+        document.querySelectorAll('.select2-dropdown').forEach((node) => {
+          node.remove();
+        });
+        """
+    )
 
 
 def fetch_next_page_via_xhr(driver, href: str):
@@ -603,12 +952,15 @@ def run(args: argparse.Namespace) -> int:
                 logger.info("condition start: %s page=%s", condition_id, page)
 
                 def open_and_search():
+                    step = "open page"
                     try:
                         driver.get("https://ap.sansan.com/v/companies/")
                         wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                        step = "capture pre-search state"
                         before_sig = row_signature(driver, By)
                         before_label = pager_label(driver, By)
 
+                        step = "find sales range selects"
                         sales_from_el = wait.until(
                         lambda d: find_first(
                             d,
@@ -635,21 +987,30 @@ def run(args: argparse.Namespace) -> int:
                         if sales_from_el is None or sales_to_el is None:
                             raise RuntimeError("sales fields not found")
 
+                        step = f"set sales from={sales_from} to={sales_to}"
                         Select(sales_from_el).select_by_visible_text(sales_from)
                         Select(sales_to_el).select_by_visible_text(sales_to)
 
+                        step = "reset industry conditions"
+                        reset_industry_conditions(driver)
+
+                        step = f"set division={industry['大分類']}"
                         select_option_by_text(driver, wait, By, "select[data-is-division='True']", industry["大分類"])
+                        step = f"set major group={industry['中分類']}"
                         select_option_by_text(driver, wait, By, "select[data-is-major-group='True']", industry["中分類"])
 
+                        step = "submit detail search"
                         search_button = wait.until(EC.element_to_be_clickable((By.ID, "button-detail-search")))
                         driver.execute_script("arguments[0].click();", search_button)
                         wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                        step = "wait for search results change"
                         changed = WebDriverWait(driver, args.short_timeout_sec + 5).until(
                             lambda d: row_signature(d, By) != before_sig or pager_label(d, By) != before_label
                         )
                         if not changed:
                             raise RuntimeError("search results did not change after submitting filters")
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("search setup step failed at %s: %s", step, exc)
                         logger.warning(
                             "search page inspect url=%s title=%s iframes=%s",
                             driver.current_url,
