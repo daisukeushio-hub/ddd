@@ -67,6 +67,7 @@ INDUSTRY_OPTION_OVERRIDES = {
     ("select[data-is-major-group='True']", "郵便局"): "R08",
     ("select[data-is-major-group='True']", "協同組合"): "R09",
     ("select[data-is-major-group='True']", "その他の事業サービス"): "R98",
+    ("select[data-is-major-group='True']", "その他のサービス"): "R99",
 }
 
 COLUMNS = [
@@ -99,6 +100,17 @@ COLUMNS = [
     "取得ページ番号",
     "重複判定キー",
 ]
+
+INDUSTRY_CONDITION_ITEM_SELECTOR = (
+    "#sansan-industrial-classification-conditions > div > ul > li.sansan-industrial-classification-condition-detail-item"
+)
+INDUSTRY_DIVISION_SELECTOR = (
+    f"{INDUSTRY_CONDITION_ITEM_SELECTOR} > div.sansan-industrial-classification-input-area > div:nth-child(2) > span > select"
+)
+INDUSTRY_MAJOR_GROUP_SELECTOR = (
+    f"{INDUSTRY_CONDITION_ITEM_SELECTOR} > div.sansan-industrial-classification-input-area > div:nth-child(3) > span > select"
+)
+INDUSTRY_CODE_INPUT_SELECTOR = f"{INDUSTRY_CONDITION_ITEM_SELECTOR} input[data-input-sicc]"
 
 
 @dataclass
@@ -289,6 +301,15 @@ def build_condition_id(sales_from: str, sales_to: str, industry: Dict[str, str])
     return f"{sales_from}-{sales_to}|{'>'.join(parts)}"
 
 
+def industry_division(industry: Dict[str, str]) -> str:
+    return next(iter(industry.values()), "")
+
+
+def industry_major_group(industry: Dict[str, str]) -> str:
+    values = list(industry.values())
+    return values[1] if len(values) > 1 else ""
+
+
 def selected_sales_indexes(args: argparse.Namespace) -> List[int]:
     if not args.sales_range:
         return list(range(len(SALES_RANGES)))
@@ -310,9 +331,69 @@ def select_custom_dropdown(driver, wait, By, EC, category_text: str, option_text
     result_option.click()
 
 
-def select_option_by_text(driver, wait, By, css_selector: str, option_text: str) -> None:
+def selected_option_text_from_element(element, By) -> str:
+    try:
+        selected = element.find_elements(By.CSS_SELECTOR, "option:checked")
+        for option in selected:
+            text = option.text.strip()
+            if text:
+                return text
+        value = (element.get_attribute("value") or "").strip()
+        if value:
+            for option in element.find_elements(By.TAG_NAME, "option"):
+                if (option.get_attribute("value") or "").strip() == value:
+                    text = option.text.strip()
+                    if text:
+                        return text
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def sync_industry_condition_input(driver, element, value: str) -> None:
+    try:
+        driver.execute_script(
+            """
+            const select = arguments[0];
+            const value = arguments[1];
+            const area = select.closest('.sansan-industrial-classification-input-area');
+            if (!area) return;
+            const hidden = area.querySelector('input[data-input-sicc]');
+            if (!hidden) return;
+            if (select.getAttribute('data-is-major-group') === 'True') {
+              hidden.value = value || '';
+            } else if (select.getAttribute('data-is-division') === 'True') {
+              hidden.value = '';
+            }
+            """,
+            element,
+            value,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+
+def select_option_by_text(driver, wait, By, css_selector: str, option_text: str):
+    def target_elements():
+        if css_selector == "select[data-is-division='True']":
+            elements = driver.find_elements(By.CSS_SELECTOR, INDUSTRY_DIVISION_SELECTOR)
+            if elements:
+                return elements
+        if css_selector == "select[data-is-major-group='True']":
+            elements = driver.find_elements(By.CSS_SELECTOR, INDUSTRY_MAJOR_GROUP_SELECTOR)
+            if elements:
+                return elements
+        try:
+            root = driver.find_element(By.CSS_SELECTOR, "#sansan-industrial-classification-conditions")
+            elements = root.find_elements(By.CSS_SELECTOR, css_selector)
+            if elements:
+                return elements
+        except Exception:  # noqa: BLE001
+            pass
+        return driver.find_elements(By.CSS_SELECTOR, css_selector)
+
     def has_selected_option_text() -> bool:
-        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+        for element in target_elements():
             try:
                 selected = element.find_elements(By.CSS_SELECTOR, "option:checked")
                 for option in selected:
@@ -323,7 +404,7 @@ def select_option_by_text(driver, wait, By, css_selector: str, option_text: str)
         return False
 
     def has_selected_value() -> bool:
-        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+        for element in target_elements():
             try:
                 value = (element.get_attribute("value") or "").strip()
                 if value:
@@ -332,11 +413,15 @@ def select_option_by_text(driver, wait, By, css_selector: str, option_text: str)
                 continue
         return False
 
-    def apply_override() -> bool:
+    def apply_override():
         override_value = INDUSTRY_OPTION_OVERRIDES.get((css_selector, option_text))
+        if not override_value and css_selector == INDUSTRY_DIVISION_SELECTOR:
+            override_value = INDUSTRY_OPTION_OVERRIDES.get(("select[data-is-division='True']", option_text))
+        if not override_value and css_selector == INDUSTRY_MAJOR_GROUP_SELECTOR:
+            override_value = INDUSTRY_OPTION_OVERRIDES.get(("select[data-is-major-group='True']", option_text))
         if not override_value:
-            return False
-        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+            return None
+        for element in target_elements():
             try:
                 driver.execute_script(
                     """
@@ -357,18 +442,20 @@ def select_option_by_text(driver, wait, By, css_selector: str, option_text: str)
                     override_value,
                     option_text,
                 )
-                return True
+                sync_industry_condition_input(driver, element, override_value)
+                return element
             except Exception:  # noqa: BLE001
                 continue
-        return False
+        return None
 
-    def select_via_ajax() -> bool:
+    def select_via_ajax():
         script = r"""
 const cssSelector = arguments[0];
 const optionText = arguments[1];
 const done = arguments[arguments.length - 1];
 
-const select = document.querySelector(cssSelector);
+const root = document.querySelector('#sansan-industrial-classification-conditions') || document;
+const select = root.querySelector(cssSelector);
 if (!select) {
   done({ok: false, reason: "select not found"});
   return;
@@ -381,8 +468,8 @@ if (!dataUrl) {
 }
 
 const targetText = optionText.trim();
-const root = select.closest('.sansan-industrial-classification-input-area');
-const divisionSelect = root ? root.querySelector("select[data-is-division='True']") : null;
+const inputArea = select.closest('.sansan-industrial-classification-input-area');
+const divisionSelect = inputArea ? inputArea.querySelector("select[data-is-division='True']") : null;
 const ancestorValue = (divisionSelect && divisionSelect.value) || "";
 
 const queryBases = [
@@ -462,16 +549,21 @@ function applyOption(value, text) {
 })();
 """
         result = driver.execute_async_script(script, css_selector, option_text)
-        return bool(result and result.get("ok"))
+        if result and result.get("ok"):
+            for element in target_elements():
+                if selected_option_text_from_element(element, By) == option_text:
+                    return element
+        return None
 
-    def select_via_modal() -> bool:
+    def select_via_modal():
         script = r"""
 const cssSelector = arguments[0];
 const optionText = arguments[1];
 const done = arguments[arguments.length - 1];
 
-const select = document.querySelector(cssSelector);
-const targetLink = document.querySelector('#sansan-industrial-classification-conditions .target-list');
+const root = document.querySelector('#sansan-industrial-classification-conditions') || document;
+const select = root.querySelector(cssSelector);
+const targetLink = root.querySelector('.target-list');
 if (!select || !targetLink) {
   done({ok: false, reason: 'modal source not found'});
   return;
@@ -543,10 +635,14 @@ function findCodeAround(node) {
 })();
 """
         result = driver.execute_async_script(script, css_selector, option_text)
-        return bool(result and result.get("ok"))
+        if result and result.get("ok"):
+            for element in target_elements():
+                if selected_option_text_from_element(element, By) == option_text:
+                    return element
+        return None
 
     def find_select():
-        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+        for element in target_elements():
             options = element.find_elements(By.TAG_NAME, "option")
             for option in options:
                 if option.text.strip() == option_text:
@@ -554,7 +650,7 @@ function findCodeAround(node) {
         return None
 
     def find_visible_select():
-        for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+        for element in target_elements():
             try:
                 container = element.find_element(
                     By.XPATH,
@@ -569,8 +665,9 @@ function findCodeAround(node) {
     last_error = None
     for _ in range(3):
         try:
-            if apply_override():
-                return
+            override_element = apply_override()
+            if override_element is not None:
+                return override_element
             result = find_select()
             if result is not None:
                 element, value = result
@@ -584,7 +681,8 @@ function findCodeAround(node) {
                     element,
                     value,
                 )
-                return
+                sync_industry_condition_input(driver, element, value)
+                return element
 
             select_element = wait.until(lambda d: find_visible_select())
             opened = driver.execute_script(
@@ -618,24 +716,42 @@ function findCodeAround(node) {
                 wait.until(
                     lambda d: has_selected_option_text() or has_selected_value() or find_select() is not None
                 )
-                return
+                result = find_select()
+                if result is not None:
+                    element, _ = result
+                    sync_industry_condition_input(driver, element, element.get_attribute("value") or "")
+                    return element
+                visible = find_visible_select()
+                if visible is not None:
+                    return visible
+                return None
             except Exception:
                 result_option_xpath = (
                     f"//li[contains(@class, 'select2-results__option') and contains(normalize-space(), '{option_text}')]"
                 )
                 result_option = wait.until(lambda d: d.find_element(By.XPATH, result_option_xpath))
                 driver.execute_script("arguments[0].click();", result_option)
-                return
+                result = find_select()
+                if result is not None:
+                    element, _ = result
+                    sync_industry_condition_input(driver, element, element.get_attribute("value") or "")
+                    return element
+                visible = find_visible_select()
+                if visible is not None:
+                    return visible
+                return None
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             try:
-                if select_via_ajax():
-                    return
+                ajax_element = select_via_ajax()
+                if ajax_element is not None:
+                    return ajax_element
             except Exception as ajax_exc:  # noqa: BLE001
                 last_error = ajax_exc
             try:
-                if select_via_modal():
-                    return
+                modal_element = select_via_modal()
+                if modal_element is not None:
+                    return modal_element
             except Exception as modal_exc:  # noqa: BLE001
                 last_error = modal_exc
             time.sleep(0.5)
@@ -656,12 +772,59 @@ def row_signature(driver, By) -> Optional[str]:
         return None
 
 
+def result_marker(driver, By) -> str:
+    sig = row_signature(driver, By) or ""
+    label = pager_label(driver, By)
+    return f"{label}||{sig}"
+
+
 def pager_label(driver, By) -> str:
     try:
         element = driver.find_element(By.CSS_SELECTOR, "ul.search-result-page-nav button.dropdown-toggle")
         return element.text.strip()
     except Exception:
         return ""
+
+
+def selected_option_text(driver, By, css_selector: str) -> str:
+    for element in driver.find_elements(By.CSS_SELECTOR, css_selector):
+        try:
+            selected = element.find_elements(By.CSS_SELECTOR, "option:checked")
+            for option in selected:
+                text = option.text.strip()
+                if text:
+                    return text
+            value = (element.get_attribute("value") or "").strip()
+            if value:
+                for option in element.find_elements(By.TAG_NAME, "option"):
+                    if (option.get_attribute("value") or "").strip() == value:
+                        text = option.text.strip()
+                        if text:
+                            return text
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def selected_industry_option_text(driver, By, css_selector: str) -> str:
+    root = driver.find_element(By.CSS_SELECTOR, "#sansan-industrial-classification-conditions")
+    for element in root.find_elements(By.CSS_SELECTOR, css_selector):
+        try:
+            selected = element.find_elements(By.CSS_SELECTOR, "option:checked")
+            for option in selected:
+                text = option.text.strip()
+                if text:
+                    return text
+            value = (element.get_attribute("value") or "").strip()
+            if value:
+                for option in element.find_elements(By.TAG_NAME, "option"):
+                    if (option.get_attribute("value") or "").strip() == value:
+                        text = option.text.strip()
+                        if text:
+                            return text
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
 
 
 def reset_industry_conditions(driver) -> None:
@@ -722,7 +885,10 @@ def fetch_next_page_via_xhr(driver, href: str):
       done({ ok: false, status: 0, error: String(err) });
     });
     """
-    return driver.execute_async_script(script, href)
+    try:
+        return driver.execute_async_script(script, href)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "status": -1, "error": str(exc)}
 
 
 def goto_next_page(driver, wait, By, logger: logging.Logger) -> bool:
@@ -814,60 +980,55 @@ def goto_next_page(driver, wait, By, logger: logging.Logger) -> bool:
 
 
 def parse_page_rows(driver, By, logger: logging.Logger) -> List[Dict[str, str]]:
-    rows = driver.find_elements(By.CLASS_NAME, "search-result-list-table-data-row")
-    data: List[Dict[str, str]] = []
+    script = r"""
+const pickText = (row, className) => {
+  const cell = row.querySelector(`.${className}`);
+  if (!cell) return "";
+  const titled = cell.querySelector("[title]");
+  if (titled && titled.getAttribute("title") != null) {
+    return titled.getAttribute("title").trim();
+  }
+  return (cell.textContent || "").trim();
+};
 
-    def safe_text(row, class_name: str) -> str:
-        try:
-            cell = row.find_element(By.CLASS_NAME, class_name)
-            tooltip_nodes = cell.find_elements(By.CSS_SELECTOR, "[title]")
-            if tooltip_nodes:
-                title = tooltip_nodes[0].get_attribute("title")
-                if title is not None:
-                    return title.strip()
-            return cell.text.strip()
-        except Exception:
-            return ""
-
-    for row in rows:
-        try:
-            url = ""
-            try:
-                url = row.find_element(By.CLASS_NAME, "url").find_element(By.TAG_NAME, "a").get_attribute("href")
-            except Exception:
-                pass
-            data.append(
-                {
-                    "会社名": safe_text(row, "company-name-label"),
-                    "_company_name": safe_text(row, "company-name-label"),
-                    "名刺所有枚数": safe_text(row, "number-of-bizcards"),
-                    "最終名刺交換日": safe_text(row, "last-bizcard-exchanged-at"),
-                    "役員・管理職": safe_text(row, "officer-and-manager"),
-                    "URL": url,
-                    "郵便番号": safe_text(row, "postal-code"),
-                    "住所": safe_text(row, "location"),
-                    "電話番号": safe_text(row, "phone-number"),
-                    "代表者の役職名": safe_text(row, "representative-title"),
-                    "代表者の氏名": safe_text(row, "representative-name"),
-                    "主業：大分類": safe_text(row, "sansan-industrial-classification-1-division"),
-                    "主業：中分類": safe_text(row, "sansan-industrial-classification-1-major-group"),
-                    "従業：大分類": safe_text(row, "sansan-industrial-classification-2-division"),
-                    "従業：中分類": safe_text(row, "sansan-industrial-classification-2-major-group"),
-                    "従業員数": safe_text(row, "employee-number"),
-                    "資本金（円）": safe_text(row, "legal-capital"),
-                    "売上高（円）": safe_text(row, "latest-sales-accounting-term-sales"),
-                    "決算年月": safe_text(row, "latest-sales-accounting-term"),
-                    "創業年月": safe_text(row, "established-at"),
-                    "設立年月": safe_text(row, "created-at"),
-                    "株式公開区分": safe_text(row, "public-offering"),
-                    "法人番号": safe_text(row, "corporate-number"),
-                    "会社キーワード": safe_text(row, "company-keyword"),
-                    "会社メモ": safe_text(row, "company-memo"),
-                }
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("row parse skipped: %s", e)
-    return data
+const rows = Array.from(document.querySelectorAll(".search-result-list-table-data-row"));
+return rows.map((row) => {
+  const urlAnchor = row.querySelector(".url a");
+  return {
+    "会社名": pickText(row, "company-name-label"),
+    "_company_name": pickText(row, "company-name-label"),
+    "名刺所有枚数": pickText(row, "number-of-bizcards"),
+    "最終名刺交換日": pickText(row, "last-bizcard-exchanged-at"),
+    "役員・管理職": pickText(row, "officer-and-manager"),
+    "URL": urlAnchor ? (urlAnchor.getAttribute("href") || "").trim() : "",
+    "郵便番号": pickText(row, "postal-code"),
+    "住所": pickText(row, "location"),
+    "電話番号": pickText(row, "phone-number"),
+    "代表者の役職名": pickText(row, "representative-title"),
+    "代表者の氏名": pickText(row, "representative-name"),
+    "主業：大分類": pickText(row, "sansan-industrial-classification-1-division"),
+    "主業：中分類": pickText(row, "sansan-industrial-classification-1-major-group"),
+    "従業：大分類": pickText(row, "sansan-industrial-classification-2-division"),
+    "従業：中分類": pickText(row, "sansan-industrial-classification-2-major-group"),
+    "従業員数": pickText(row, "employee-number"),
+    "資本金（円）": pickText(row, "legal-capital"),
+    "売上高（円）": pickText(row, "latest-sales-accounting-term-sales"),
+    "決算年月": pickText(row, "latest-sales-accounting-term"),
+    "創業年月": pickText(row, "established-at"),
+    "設立年月": pickText(row, "created-at"),
+    "株式公開区分": pickText(row, "public-offering"),
+    "法人番号": pickText(row, "corporate-number"),
+    "会社キーワード": pickText(row, "company-keyword"),
+    "会社メモ": pickText(row, "company-memo")
+  };
+});
+"""
+    try:
+        result = driver.execute_script(script)
+        return result if isinstance(result, list) else []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("page parse via js failed: %s", exc)
+        raise
 
 
 def run(args: argparse.Namespace) -> int:
@@ -908,6 +1069,17 @@ def run(args: argparse.Namespace) -> int:
             state = loaded
             logger.info("resume enabled; restored state from %s", state_path)
 
+    if args.cursor_sales_index is not None or args.cursor_industry_index is not None or args.cursor_page is not None:
+        state["cursor"] = {
+            "sales_index": args.cursor_sales_index if args.cursor_sales_index is not None else state["cursor"].get("sales_index", 0),
+            "industry_index": args.cursor_industry_index if args.cursor_industry_index is not None else state["cursor"].get("industry_index", 0),
+            "page": args.cursor_page if args.cursor_page is not None else state["cursor"].get("page", 1),
+        }
+        state["status"] = "running"
+        state["last_error"] = None
+        state_store.save(state)
+        logger.info("cursor overridden to sales_index=%s industry_index=%s page=%s", state["cursor"]["sales_index"], state["cursor"]["industry_index"], state["cursor"]["page"])
+
     start_cursor = Cursor(
         sales_index=state["cursor"].get("sales_index", 0),
         industry_index=state["cursor"].get("industry_index", 0),
@@ -932,6 +1104,7 @@ def run(args: argparse.Namespace) -> int:
         logger.info("login submitted")
 
         condition_count = 0
+        last_condition_context: Dict[str, str] = {"condition_id": "", "marker": ""}
         for si, (sales_from, sales_to) in enumerate(SALES_RANGES):
             if si not in allowed_sales_indexes:
                 continue
@@ -994,10 +1167,35 @@ def run(args: argparse.Namespace) -> int:
                         step = "reset industry conditions"
                         reset_industry_conditions(driver)
 
-                        step = f"set division={industry['大分類']}"
-                        select_option_by_text(driver, wait, By, "select[data-is-division='True']", industry["大分類"])
-                        step = f"set major group={industry['中分類']}"
-                        select_option_by_text(driver, wait, By, "select[data-is-major-group='True']", industry["中分類"])
+                        pending_division = industry_division(industry)
+                        pending_major_group = industry_major_group(industry)
+
+                        step = f"set division={pending_division}"
+                        division_select = select_option_by_text(
+                            driver, wait, By, INDUSTRY_DIVISION_SELECTOR, pending_division
+                        )
+                        step = f"set major group={pending_major_group}"
+                        major_group_select = select_option_by_text(
+                            driver, wait, By, INDUSTRY_MAJOR_GROUP_SELECTOR, pending_major_group
+                        )
+
+                        step = "verify selected filters"
+                        selected_division = selected_option_text_from_element(division_select, By) if division_select else ""
+                        selected_major_group = (
+                            selected_option_text_from_element(major_group_select, By) if major_group_select else ""
+                        )
+                        if selected_division != pending_division:
+                            logger.warning(
+                                "division verify mismatch selected='%s' expected='%s'",
+                                selected_division,
+                                pending_division,
+                            )
+                        if selected_major_group != pending_major_group:
+                            logger.warning(
+                                "major group verify mismatch selected='%s' expected='%s'",
+                                selected_major_group,
+                                pending_major_group,
+                            )
 
                         step = "submit detail search"
                         search_button = wait.until(EC.element_to_be_clickable((By.ID, "button-detail-search")))
@@ -1009,6 +1207,14 @@ def run(args: argparse.Namespace) -> int:
                         )
                         if not changed:
                             raise RuntimeError("search results did not change after submitting filters")
+                        step = "validate result marker changed from previous condition"
+                        current_marker = result_marker(driver, By)
+                        previous_condition_id = last_condition_context["condition_id"]
+                        previous_marker = last_condition_context["marker"]
+                        if previous_condition_id and previous_condition_id != condition_id and current_marker == previous_marker:
+                            raise RuntimeError(
+                                f"search results repeated previous condition marker previous='{previous_condition_id}' current='{condition_id}' marker='{current_marker}'"
+                            )
                     except Exception as exc:
                         logger.warning("search setup step failed at %s: %s", step, exc)
                         logger.warning(
@@ -1040,6 +1246,10 @@ def run(args: argparse.Namespace) -> int:
                             dump_debug_artifacts(driver, f"pagination_no_rows_page_{page}", logger)
                         logger.info("no rows at condition=%s page=%s", condition_id, page)
                         break
+
+                    if page == 1:
+                        last_condition_context["condition_id"] = condition_id
+                        last_condition_context["marker"] = result_marker(driver, By)
 
                     raw_rows = retry_call(lambda: parse_page_rows(driver, By, logger), args.retries, logger, "parse page")
                     state["stats"]["rows_seen"] += len(raw_rows)
@@ -1103,7 +1313,10 @@ def run(args: argparse.Namespace) -> int:
         return 1
     finally:
         dedupe_store.close()
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1120,6 +1333,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout-sec", type=int, default=20)
     p.add_argument("--short-timeout-sec", type=int, default=3)
     p.add_argument("--retries", type=int, default=3)
+    p.add_argument("--cursor-sales-index", type=int, default=None)
+    p.add_argument("--cursor-industry-index", type=int, default=None)
+    p.add_argument("--cursor-page", type=int, default=None)
     p.add_argument("--verbose", action="store_true")
     return p
 
