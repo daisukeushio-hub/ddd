@@ -56,6 +56,65 @@ SALES_RANGE_CHOICES = {
     "5000-1cho": ("5,000億", "1兆"),
 }
 
+EMPLOYEE_RANGE_VALUES = ["5", "10", "30", "50", "100", "200", "300", "500", "1000", "3000", "5000", "10000"]
+DEFAULT_EMPLOYEE_SPLITS: List[Tuple[Optional[str], Optional[str]]] = [
+    (None, "100"),
+    ("100", "300"),
+    ("300", "1000"),
+    ("1000", "3000"),
+    ("3000", "10000"),
+    ("10000", None),
+]
+PREFECTURES = [
+    "北海道",
+    "青森県",
+    "岩手県",
+    "宮城県",
+    "秋田県",
+    "山形県",
+    "福島県",
+    "茨城県",
+    "栃木県",
+    "群馬県",
+    "埼玉県",
+    "千葉県",
+    "東京都",
+    "神奈川県",
+    "新潟県",
+    "富山県",
+    "石川県",
+    "福井県",
+    "山梨県",
+    "長野県",
+    "岐阜県",
+    "静岡県",
+    "愛知県",
+    "三重県",
+    "滋賀県",
+    "京都府",
+    "大阪府",
+    "兵庫県",
+    "奈良県",
+    "和歌山県",
+    "鳥取県",
+    "島根県",
+    "岡山県",
+    "広島県",
+    "山口県",
+    "徳島県",
+    "香川県",
+    "愛媛県",
+    "高知県",
+    "福岡県",
+    "佐賀県",
+    "長崎県",
+    "熊本県",
+    "大分県",
+    "宮崎県",
+    "鹿児島県",
+    "沖縄県",
+]
+
 INDUSTRY_OPTION_OVERRIDES = {
     ("select[data-is-major-group='True']", "廃棄物処理"): "R01",
     ("select[data-is-major-group='True']", "自動車整備"): "R02",
@@ -294,11 +353,100 @@ def setup_logger(log_path: Path, verbose: bool) -> logging.Logger:
     return logger
 
 
-def build_condition_id(sales_from: str, sales_to: str, industry: Dict[str, str]) -> str:
+def build_condition_id(
+    sales_from: str,
+    sales_to: str,
+    industry: Dict[str, str],
+    employee_from: Optional[str] = None,
+    employee_to: Optional[str] = None,
+    location: Optional[str] = None,
+) -> str:
     parts = [industry["大分類"], industry["中分類"]]
     if industry.get("小分類"):
         parts.append(industry["小分類"])
-    return f"{sales_from}-{sales_to}|{'>'.join(parts)}"
+    condition_id = f"{sales_from}-{sales_to}|{'>'.join(parts)}"
+    if employee_from or employee_to:
+        condition_id += f"|従業員数:{employee_from or '--'}-{employee_to or '--'}"
+    if location:
+        condition_id += f"|住所:{location}"
+    return condition_id
+
+
+def make_split_task(
+    employee_from: Optional[str] = None,
+    employee_to: Optional[str] = None,
+    location: Optional[str] = None,
+    page: int = 1,
+    split_level: str = "base",
+) -> Dict[str, Any]:
+    return {
+        "employee_from": employee_from,
+        "employee_to": employee_to,
+        "location": location,
+        "page": page,
+        "split_level": split_level,
+    }
+
+
+def build_split_tasks_for_employee() -> List[Dict[str, Any]]:
+    return [
+        make_split_task(employee_from=employee_from, employee_to=employee_to, split_level="employee")
+        for employee_from, employee_to in DEFAULT_EMPLOYEE_SPLITS
+    ]
+
+
+def build_split_tasks_for_prefecture(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        make_split_task(
+            employee_from=task.get("employee_from"),
+            employee_to=task.get("employee_to"),
+            location=prefecture,
+            split_level="prefecture",
+        )
+        for prefecture in PREFECTURES
+    ]
+
+
+def set_cursor_state(state: Dict[str, Any], sales_index: int, industry_index: int, page: int) -> None:
+    state["cursor"] = {"sales_index": sales_index, "industry_index": industry_index, "page": page}
+
+
+def set_split_context(
+    state: Dict[str, Any],
+    sales_index: int,
+    industry_index: int,
+    pending_tasks: Optional[List[Dict[str, Any]]],
+) -> None:
+    state["split_context"] = (
+        {"sales_index": sales_index, "industry_index": industry_index, "pending_tasks": pending_tasks}
+        if pending_tasks
+        else None
+    )
+
+
+def persist_current_task(
+    state: Dict[str, Any],
+    sales_index: int,
+    industry_index: int,
+    page: int,
+    current_task: Dict[str, Any],
+    remaining_tasks: List[Dict[str, Any]],
+) -> None:
+    current_task["page"] = page
+    set_cursor_state(state, sales_index, industry_index, page)
+    set_split_context(state, sales_index, industry_index, [current_task] + remaining_tasks)
+
+
+def parse_total_count(driver, By) -> Optional[int]:
+    try:
+        element = driver.find_element(By.CSS_SELECTOR, "#company-index-total-count")
+        text = (element.text or "").strip()
+        if not text:
+            return None
+        digits = re.sub(r"[^\d]", "", text)
+        return int(digits) if digits else None
+    except Exception:
+        return None
 
 
 def industry_division(industry: Dict[str, str]) -> str:
@@ -764,10 +912,14 @@ def row_signature(driver, By) -> Optional[str]:
         rows = driver.find_elements(By.CLASS_NAME, "search-result-list-table-data-row")
         if not rows:
             return None
-        try:
-            return rows[0].get_attribute("data-latest-soc") or rows[0].text
-        except Exception:
-            return None
+        parts = []
+        for row in rows[:5]:
+            try:
+                parts.append((row.get_attribute("data-latest-soc") or row.text or "").strip())
+            except Exception:
+                continue
+        signature = "||".join(part for part in parts if part)
+        return signature or None
     except Exception:
         return None
 
@@ -913,6 +1065,7 @@ def goto_next_page(driver, wait, By, logger: logging.Logger) -> bool:
         current_label,
     )
 
+    click_exc = None
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_button)
         driver.execute_script(
@@ -938,9 +1091,13 @@ def goto_next_page(driver, wait, By, logger: logging.Logger) -> bool:
         return True
     except Exception as click_exc:  # noqa: BLE001
         logger.warning("next page click failed: %s", click_exc)
+        if "invalid session id" in str(click_exc).lower():
+            raise RuntimeError("webdriver session lost during next page click") from click_exc
 
     xhr_result = fetch_next_page_via_xhr(driver, href)
     logger.info("next page xhr result status=%s ok=%s", xhr_result.get("status"), xhr_result.get("ok"))
+    if "invalid session id" in str(xhr_result.get("error", "")).lower():
+        raise RuntimeError("webdriver session lost during next page xhr fallback") from click_exc
 
     if xhr_result.get("ok") and xhr_result.get("text"):
         driver.execute_script(
@@ -976,7 +1133,9 @@ def goto_next_page(driver, wait, By, logger: logging.Logger) -> bool:
         return True
 
     dump_debug_artifacts(driver, "next_page_failure", logger)
-    raise RuntimeError(f"failed to move to next page href={href}") from click_exc
+    if click_exc is not None:
+        raise RuntimeError(f"failed to move to next page href={href}") from click_exc
+    raise RuntimeError(f"failed to move to next page href={href}")
 
 
 def parse_page_rows(driver, By, logger: logging.Logger) -> List[Dict[str, str]]:
@@ -1061,6 +1220,7 @@ def run(args: argparse.Namespace) -> int:
         "stats": {"rows_seen": 0, "rows_written": 0, "rows_duplicated": 0, "conditions_done": 0, "errors": 0},
         "updated_at": now_iso(),
         "last_error": None,
+        "split_context": None,
     }
 
     if args.resume:
@@ -1070,11 +1230,12 @@ def run(args: argparse.Namespace) -> int:
             logger.info("resume enabled; restored state from %s", state_path)
 
     if args.cursor_sales_index is not None or args.cursor_industry_index is not None or args.cursor_page is not None:
-        state["cursor"] = {
-            "sales_index": args.cursor_sales_index if args.cursor_sales_index is not None else state["cursor"].get("sales_index", 0),
-            "industry_index": args.cursor_industry_index if args.cursor_industry_index is not None else state["cursor"].get("industry_index", 0),
-            "page": args.cursor_page if args.cursor_page is not None else state["cursor"].get("page", 1),
-        }
+        set_cursor_state(
+            state,
+            args.cursor_sales_index if args.cursor_sales_index is not None else state["cursor"].get("sales_index", 0),
+            args.cursor_industry_index if args.cursor_industry_index is not None else state["cursor"].get("industry_index", 0),
+            args.cursor_page if args.cursor_page is not None else state["cursor"].get("page", 1),
+        )
         state["status"] = "running"
         state["last_error"] = None
         state_store.save(state)
@@ -1120,183 +1281,322 @@ def run(args: argparse.Namespace) -> int:
                     return 0
 
                 condition_count += 1
-                page = start_cursor.page if (si == start_cursor.sales_index and ii == start_cursor.industry_index) else 1
-                condition_id = build_condition_id(sales_from, sales_to, industry)
-                logger.info("condition start: %s page=%s", condition_id, page)
-
-                def open_and_search():
-                    step = "open page"
-                    try:
-                        driver.get("https://ap.sansan.com/v/companies/")
-                        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-                        step = "capture pre-search state"
-                        before_sig = row_signature(driver, By)
-                        before_label = pager_label(driver, By)
-
-                        step = "find sales range selects"
-                        sales_from_el = wait.until(
-                        lambda d: find_first(
-                            d,
-                            By.CSS_SELECTOR,
-                            [
-                                "#SearchInput_LatestSalesAccountingTermSalesFrom",
-                                "select[id*='LatestSalesAccountingTermSalesFrom']",
-                                "select[name*='LatestSalesAccountingTermSalesFrom']",
-                            ],
+                if (
+                    state.get("split_context")
+                    and state["split_context"].get("sales_index") == si
+                    and state["split_context"].get("industry_index") == ii
+                ):
+                    task_queue = state["split_context"].get("pending_tasks", [])
+                else:
+                    initial_page = start_cursor.page if (si == start_cursor.sales_index and ii == start_cursor.industry_index) else 1
+                    initial_level = "manual" if (args.employee_from or args.employee_to or args.location) else "base"
+                    task_queue = [
+                        make_split_task(
+                            employee_from=args.employee_from,
+                            employee_to=args.employee_to,
+                            location=args.location,
+                            page=initial_page,
+                            split_level=initial_level,
                         )
-                        )
-                        sales_to_el = wait.until(
-                        lambda d: find_first(
-                            d,
-                            By.CSS_SELECTOR,
-                            [
-                                "#SearchInput_LatestSalesAccountingTermSalesTo",
-                                "select[id*='LatestSalesAccountingTermSalesTo']",
-                                "select[name*='LatestSalesAccountingTermSalesTo']",
-                            ],
-                        )
-                        )
+                    ]
 
-                        if sales_from_el is None or sales_to_el is None:
-                            raise RuntimeError("sales fields not found")
-
-                        step = f"set sales from={sales_from} to={sales_to}"
-                        Select(sales_from_el).select_by_visible_text(sales_from)
-                        Select(sales_to_el).select_by_visible_text(sales_to)
-
-                        step = "reset industry conditions"
-                        reset_industry_conditions(driver)
-
-                        pending_division = industry_division(industry)
-                        pending_major_group = industry_major_group(industry)
-
-                        step = f"set division={pending_division}"
-                        division_select = select_option_by_text(
-                            driver, wait, By, INDUSTRY_DIVISION_SELECTOR, pending_division
-                        )
-                        step = f"set major group={pending_major_group}"
-                        major_group_select = select_option_by_text(
-                            driver, wait, By, INDUSTRY_MAJOR_GROUP_SELECTOR, pending_major_group
-                        )
-
-                        step = "verify selected filters"
-                        selected_division = selected_option_text_from_element(division_select, By) if division_select else ""
-                        selected_major_group = (
-                            selected_option_text_from_element(major_group_select, By) if major_group_select else ""
-                        )
-                        if selected_division != pending_division:
-                            logger.warning(
-                                "division verify mismatch selected='%s' expected='%s'",
-                                selected_division,
-                                pending_division,
-                            )
-                        if selected_major_group != pending_major_group:
-                            logger.warning(
-                                "major group verify mismatch selected='%s' expected='%s'",
-                                selected_major_group,
-                                pending_major_group,
-                            )
-
-                        step = "submit detail search"
-                        search_button = wait.until(EC.element_to_be_clickable((By.ID, "button-detail-search")))
-                        driver.execute_script("arguments[0].click();", search_button)
-                        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-                        step = "wait for search results change"
-                        changed = WebDriverWait(driver, args.short_timeout_sec + 5).until(
-                            lambda d: row_signature(d, By) != before_sig or pager_label(d, By) != before_label
-                        )
-                        if not changed:
-                            raise RuntimeError("search results did not change after submitting filters")
-                        step = "validate result marker changed from previous condition"
-                        current_marker = result_marker(driver, By)
-                        previous_condition_id = last_condition_context["condition_id"]
-                        previous_marker = last_condition_context["marker"]
-                        if previous_condition_id and previous_condition_id != condition_id and current_marker == previous_marker:
-                            raise RuntimeError(
-                                f"search results repeated previous condition marker previous='{previous_condition_id}' current='{condition_id}' marker='{current_marker}'"
-                            )
-                    except Exception as exc:
-                        logger.warning("search setup step failed at %s: %s", step, exc)
-                        logger.warning(
-                            "search page inspect url=%s title=%s iframes=%s",
-                            driver.current_url,
-                            driver.title,
-                            len(driver.find_elements(By.TAG_NAME, "iframe")),
-                        )
-                        dump_debug_artifacts(driver, "search_setup_failure", logger)
-                        raise
-
-                retry_call(open_and_search, args.retries, logger, "search setup")
-
-                for p in range(1, page):
-                    try:
-                        if not goto_next_page(driver, wait, By, logger):
-                            raise RuntimeError("next page not found while fast-forwarding")
-                    except Exception as e:  # noqa: BLE001
-                        logger.error("resume fast-forward failed at page=%s: %s", p, e)
-                        break
-
-                while True:
-                    state["cursor"] = {"sales_index": si, "industry_index": ii, "page": page}
-                    try:
-                        wait.until(EC.presence_of_element_located((By.CLASS_NAME, "search-result-list-table-data-row")))
-                    except TimeoutException:
-                        if page > 1:
-                            logger.warning("no rows after pagination url=%s page=%s", driver.current_url, page)
-                            dump_debug_artifacts(driver, f"pagination_no_rows_page_{page}", logger)
-                        logger.info("no rows at condition=%s page=%s", condition_id, page)
-                        break
-
-                    if page == 1:
-                        last_condition_context["condition_id"] = condition_id
-                        last_condition_context["marker"] = result_marker(driver, By)
-
-                    raw_rows = retry_call(lambda: parse_page_rows(driver, By, logger), args.retries, logger, "parse page")
-                    state["stats"]["rows_seen"] += len(raw_rows)
-
-                    new_rows: List[Dict[str, Any]] = []
-                    for row in raw_rows:
-                        name = row.get("_company_name", "")
-                        address = row.get("住所", "")
-                        key = make_dedupe_key(name, address)
-                        if dedupe_store.seen(key):
-                            state["stats"]["rows_duplicated"] += 1
-                            continue
-                        row["取得日時"] = now_iso()
-                        row["検索条件ID"] = condition_id
-                        row["取得ページ番号"] = page
-                        row["重複判定キー"] = key
-                        new_rows.append(row)
-
-                    sink.append_rows(new_rows)
-                    for row in new_rows:
-                        dedupe_store.insert(
-                            row["重複判定キー"], row["_company_name"], row["住所"], row["検索条件ID"], int(row["取得ページ番号"])
-                        )
-                    state["stats"]["rows_written"] += len(new_rows)
-                    logger.info(
-                        "page done condition=%s page=%s seen=%s written=%s dup=%s",
-                        condition_id,
-                        page,
-                        len(raw_rows),
-                        len(new_rows),
-                        len(raw_rows) - len(new_rows),
+                while task_queue:
+                    current_task = task_queue.pop(0)
+                    page = int(current_task.get("page", 1))
+                    condition_id = build_condition_id(
+                        sales_from,
+                        sales_to,
+                        industry,
+                        current_task.get("employee_from"),
+                        current_task.get("employee_to"),
+                        current_task.get("location"),
                     )
+                    persist_current_task(state, si, ii, page, current_task, task_queue)
+                    state_store.save(state)
+                    logger.info("condition start: %s page=%s", condition_id, page)
+                    search_context: Dict[str, Any] = {"total_count": None}
+
+                    def open_and_search():
+                        step = "open page"
+                        try:
+                            driver.get("https://ap.sansan.com/v/companies/")
+                            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                            step = "capture pre-search state"
+                            before_sig = row_signature(driver, By)
+                            before_label = pager_label(driver, By)
+                            before_total_count = parse_total_count(driver, By)
+
+                            step = "find sales range selects"
+                            sales_from_el = wait.until(
+                                lambda d: find_first(
+                                    d,
+                                    By.CSS_SELECTOR,
+                                    [
+                                        "#SearchInput_LatestSalesAccountingTermSalesFrom",
+                                        "select[id*='LatestSalesAccountingTermSalesFrom']",
+                                        "select[name*='LatestSalesAccountingTermSalesFrom']",
+                                    ],
+                                )
+                            )
+                            sales_to_el = wait.until(
+                                lambda d: find_first(
+                                    d,
+                                    By.CSS_SELECTOR,
+                                    [
+                                        "#SearchInput_LatestSalesAccountingTermSalesTo",
+                                        "select[id*='LatestSalesAccountingTermSalesTo']",
+                                        "select[name*='LatestSalesAccountingTermSalesTo']",
+                                    ],
+                                )
+                            )
+
+                            if sales_from_el is None or sales_to_el is None:
+                                raise RuntimeError("sales fields not found")
+
+                            step = f"set sales from={sales_from} to={sales_to}"
+                            Select(sales_from_el).select_by_visible_text(sales_from)
+                            Select(sales_to_el).select_by_visible_text(sales_to)
+
+                            step = "find employee number selects"
+                            employee_from_el = find_first(
+                                driver,
+                                By.CSS_SELECTOR,
+                                [
+                                    "#SearchInput_EmployeeNumberFrom",
+                                    "select[id*='EmployeeNumberFrom']",
+                                    "select[name='EmployeeNumberFrom']",
+                                ],
+                            )
+                            employee_to_el = find_first(
+                                driver,
+                                By.CSS_SELECTOR,
+                                [
+                                    "#SearchInput_EmployeeNumberTo",
+                                    "select[id*='EmployeeNumberTo']",
+                                    "select[name='EmployeeNumberTo']",
+                                ],
+                            )
+                            if employee_from_el is None or employee_to_el is None:
+                                raise RuntimeError("employee number fields not found")
+                            step = (
+                                f"set employee range from={current_task.get('employee_from') or '--'} "
+                                f"to={current_task.get('employee_to') or '--'}"
+                            )
+                            Select(employee_from_el).select_by_value(current_task.get("employee_from") or "")
+                            Select(employee_to_el).select_by_value(current_task.get("employee_to") or "")
+
+                            step = "set location"
+                            location_el = find_first(
+                                driver,
+                                By.CSS_SELECTOR,
+                                [
+                                    "#SearchInput_Location",
+                                    "input[id*='Location']",
+                                    "input[name='Location']",
+                                ],
+                            )
+                            if location_el is None:
+                                raise RuntimeError("location field not found")
+                            location_el.clear()
+                            if current_task.get("location"):
+                                location_el.send_keys(current_task["location"])
+
+                            step = "reset industry conditions"
+                            reset_industry_conditions(driver)
+
+                            pending_division = industry_division(industry)
+                            pending_major_group = industry_major_group(industry)
+
+                            step = f"set division={pending_division}"
+                            division_select = select_option_by_text(
+                                driver, wait, By, INDUSTRY_DIVISION_SELECTOR, pending_division
+                            )
+                            step = f"set major group={pending_major_group}"
+                            major_group_select = select_option_by_text(
+                                driver, wait, By, INDUSTRY_MAJOR_GROUP_SELECTOR, pending_major_group
+                            )
+
+                            step = "verify selected filters"
+                            selected_division = selected_option_text_from_element(division_select, By) if division_select else ""
+                            selected_major_group = (
+                                selected_option_text_from_element(major_group_select, By) if major_group_select else ""
+                            )
+                            if selected_division != pending_division:
+                                logger.warning(
+                                    "division verify mismatch selected='%s' expected='%s'",
+                                    selected_division,
+                                    pending_division,
+                                )
+                            if selected_major_group != pending_major_group:
+                                logger.warning(
+                                    "major group verify mismatch selected='%s' expected='%s'",
+                                    selected_major_group,
+                                    pending_major_group,
+                                )
+
+                            step = "submit detail search"
+                            search_button = wait.until(EC.element_to_be_clickable((By.ID, "button-detail-search")))
+                            driver.execute_script("arguments[0].click();", search_button)
+                            wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                            step = "wait for search results change"
+                            try:
+                                changed = WebDriverWait(driver, args.short_timeout_sec + 5).until(
+                                    lambda d: (
+                                        row_signature(d, By) != before_sig
+                                        or pager_label(d, By) != before_label
+                                        or parse_total_count(d, By) != before_total_count
+                                    )
+                                )
+                            except Exception:
+                                total_count = parse_total_count(driver, By)
+                                if total_count == 0:
+                                    logger.info(
+                                        "search results unchanged but zero-count accepted condition=%s",
+                                        condition_id,
+                                    )
+                                    changed = True
+                                else:
+                                    raise
+                            if not changed:
+                                raise RuntimeError("search results did not change after submitting filters")
+                            step = "validate result marker changed from previous condition"
+                            current_marker = result_marker(driver, By)
+                            previous_condition_id = last_condition_context["condition_id"]
+                            previous_marker = last_condition_context["marker"]
+                            if previous_condition_id and previous_condition_id != condition_id and current_marker == previous_marker:
+                                raise RuntimeError(
+                                    f"search results repeated previous condition marker previous='{previous_condition_id}' current='{condition_id}' marker='{current_marker}'"
+                                )
+                            total_count = parse_total_count(driver, By)
+                            search_context["total_count"] = total_count
+                            if total_count is not None:
+                                logger.info("condition total_count=%s condition=%s", total_count, condition_id)
+                        except Exception as exc:
+                            logger.warning("search setup step failed at %s: %s", step, exc)
+                            logger.warning(
+                                "search page inspect url=%s title=%s iframes=%s",
+                                driver.current_url,
+                                driver.title,
+                                len(driver.find_elements(By.TAG_NAME, "iframe")),
+                            )
+                            dump_debug_artifacts(driver, "search_setup_failure", logger)
+                            raise
+
+                    retry_call(open_and_search, args.retries, logger, "search setup")
+
+                    total_count = search_context.get("total_count")
+                    if page == 1 and total_count is not None and total_count > args.split_threshold:
+                        if (
+                            current_task.get("split_level") == "base"
+                            and not current_task.get("employee_from")
+                            and not current_task.get("employee_to")
+                            and not current_task.get("location")
+                        ):
+                            split_tasks = build_split_tasks_for_employee()
+                            logger.info(
+                                "auto split by employee count total_count=%s threshold=%s condition=%s subtasks=%s",
+                                total_count,
+                                args.split_threshold,
+                                condition_id,
+                                len(split_tasks),
+                            )
+                            task_queue = split_tasks + task_queue
+                            set_split_context(state, si, ii, task_queue)
+                            state_store.save(state)
+                            continue
+                        if current_task.get("split_level") in ("employee", "manual") and not current_task.get("location"):
+                            split_tasks = build_split_tasks_for_prefecture(current_task)
+                            logger.info(
+                                "auto split by prefecture total_count=%s threshold=%s condition=%s subtasks=%s",
+                                total_count,
+                                args.split_threshold,
+                                condition_id,
+                                len(split_tasks),
+                            )
+                            task_queue = split_tasks + task_queue
+                            set_split_context(state, si, ii, task_queue)
+                            state_store.save(state)
+                            continue
+                        logger.warning(
+                            "condition still exceeds split threshold after auto split total_count=%s threshold=%s condition=%s",
+                            total_count,
+                            args.split_threshold,
+                            condition_id,
+                        )
+
+                    for p in range(1, page):
+                        try:
+                            if not goto_next_page(driver, wait, By, logger):
+                                raise RuntimeError("next page not found while fast-forwarding")
+                        except Exception as e:  # noqa: BLE001
+                            logger.error("resume fast-forward failed at page=%s: %s", p, e)
+                            break
+
+                    while True:
+                        persist_current_task(state, si, ii, page, current_task, task_queue)
+                        try:
+                            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "search-result-list-table-data-row")))
+                        except TimeoutException:
+                            if page > 1:
+                                logger.warning("no rows after pagination url=%s page=%s", driver.current_url, page)
+                                dump_debug_artifacts(driver, f"pagination_no_rows_page_{page}", logger)
+                            logger.info("no rows at condition=%s page=%s", condition_id, page)
+                            break
+
+                        if page == 1:
+                            last_condition_context["condition_id"] = condition_id
+                            last_condition_context["marker"] = result_marker(driver, By)
+
+                        raw_rows = retry_call(lambda: parse_page_rows(driver, By, logger), args.retries, logger, "parse page")
+                        state["stats"]["rows_seen"] += len(raw_rows)
+
+                        new_rows: List[Dict[str, Any]] = []
+                        for row in raw_rows:
+                            name = row.get("_company_name", "")
+                            address = row.get("住所", "")
+                            key = make_dedupe_key(name, address)
+                            if dedupe_store.seen(key):
+                                state["stats"]["rows_duplicated"] += 1
+                                continue
+                            row["取得日時"] = now_iso()
+                            row["検索条件ID"] = condition_id
+                            row["取得ページ番号"] = page
+                            row["重複判定キー"] = key
+                            new_rows.append(row)
+
+                        sink.append_rows(new_rows)
+                        for row in new_rows:
+                            dedupe_store.insert(
+                                row["重複判定キー"], row["_company_name"], row["住所"], row["検索条件ID"], int(row["取得ページ番号"])
+                            )
+                        state["stats"]["rows_written"] += len(new_rows)
+                        logger.info(
+                            "page done condition=%s page=%s seen=%s written=%s dup=%s",
+                            condition_id,
+                            page,
+                            len(raw_rows),
+                            len(new_rows),
+                            len(raw_rows) - len(new_rows),
+                        )
+                        state_store.save(state)
+
+                        try:
+                            if not goto_next_page(driver, WebDriverWait(driver, args.short_timeout_sec), By, logger):
+                                break
+                            page += 1
+                        except TimeoutException:
+                            logger.info("next page timeout at condition=%s page=%s url=%s", condition_id, page, driver.current_url)
+                            break
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("next page transition failed at condition=%s page=%s: %s", condition_id, page, e)
+                            break
+
+                    set_split_context(state, si, ii, task_queue)
                     state_store.save(state)
 
-                    try:
-                        if not goto_next_page(driver, WebDriverWait(driver, args.short_timeout_sec), By, logger):
-                            break
-                        page += 1
-                    except TimeoutException:
-                        logger.info("next page timeout at condition=%s page=%s url=%s", condition_id, page, driver.current_url)
-                        break
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("next page transition failed at condition=%s page=%s: %s", condition_id, page, e)
-                        break
-
                 state["stats"]["conditions_done"] += 1
-                state["cursor"] = {"sales_index": si, "industry_index": ii + 1, "page": 1}
+                set_cursor_state(state, si, ii + 1, 1)
+                set_split_context(state, si, ii, None)
                 state_store.save(state)
 
         state["status"] = "completed"
@@ -1330,6 +1630,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--headless", action="store_true")
     p.add_argument("--max-conditions", type=int, default=0)
     p.add_argument("--sales-range", choices=sorted(SALES_RANGE_CHOICES.keys()), default="")
+    p.add_argument("--employee-from", choices=EMPLOYEE_RANGE_VALUES, default=None)
+    p.add_argument("--employee-to", choices=EMPLOYEE_RANGE_VALUES, default=None)
+    p.add_argument("--location", default=None)
+    p.add_argument("--split-threshold", type=int, default=1000)
     p.add_argument("--timeout-sec", type=int, default=20)
     p.add_argument("--short-timeout-sec", type=int, default=3)
     p.add_argument("--retries", type=int, default=3)
