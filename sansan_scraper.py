@@ -360,6 +360,7 @@ def build_condition_id(
     employee_from: Optional[str] = None,
     employee_to: Optional[str] = None,
     location: Optional[str] = None,
+    rescue_label: Optional[str] = None,
 ) -> str:
     parts = [industry["大分類"], industry["中分類"]]
     if industry.get("小分類"):
@@ -369,6 +370,8 @@ def build_condition_id(
         condition_id += f"|従業員数:{employee_from or '--'}-{employee_to or '--'}"
     if location:
         condition_id += f"|住所:{location}"
+    if rescue_label:
+        condition_id += f"|救済:{rescue_label}"
     return condition_id
 
 
@@ -378,6 +381,8 @@ def make_split_task(
     location: Optional[str] = None,
     page: int = 1,
     split_level: str = "base",
+    parent_condition_id: Optional[str] = None,
+    rescue_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "employee_from": employee_from,
@@ -385,26 +390,130 @@ def make_split_task(
         "location": location,
         "page": page,
         "split_level": split_level,
+        "parent_condition_id": parent_condition_id,
+        "rescue_label": rescue_label,
     }
 
 
-def build_split_tasks_for_employee() -> List[Dict[str, Any]]:
+def build_split_tasks_for_employee(parent_condition_id: str) -> List[Dict[str, Any]]:
     return [
-        make_split_task(employee_from=employee_from, employee_to=employee_to, split_level="employee")
+        make_split_task(
+            employee_from=employee_from,
+            employee_to=employee_to,
+            split_level="employee",
+            parent_condition_id=parent_condition_id,
+        )
         for employee_from, employee_to in DEFAULT_EMPLOYEE_SPLITS
     ]
 
 
-def build_split_tasks_for_prefecture(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_split_tasks_for_prefecture(task: Dict[str, Any], parent_condition_id: str) -> List[Dict[str, Any]]:
     return [
         make_split_task(
             employee_from=task.get("employee_from"),
             employee_to=task.get("employee_to"),
             location=prefecture,
             split_level="prefecture",
+            parent_condition_id=parent_condition_id,
         )
         for prefecture in PREFECTURES
     ]
+
+
+def init_audits(state: Dict[str, Any]) -> None:
+    state.setdefault("audits", {})
+    state["audits"].setdefault("entries", {})
+
+
+def condition_id_for_task(sales_from: str, sales_to: str, industry: Dict[str, str], task: Dict[str, Any]) -> str:
+    return build_condition_id(
+        sales_from,
+        sales_to,
+        industry,
+        task.get("employee_from"),
+        task.get("employee_to"),
+        task.get("location"),
+        task.get("rescue_label"),
+    )
+
+
+def register_split_audit(
+    state: Dict[str, Any],
+    sales_from: str,
+    sales_to: str,
+    industry: Dict[str, str],
+    parent_condition_id: str,
+    split_kind: str,
+    expected_total: int,
+    child_tasks: List[Dict[str, Any]],
+    rescue_task: Optional[Dict[str, Any]] = None,
+) -> None:
+    init_audits(state)
+    state["audits"]["entries"][parent_condition_id] = {
+        "split_kind": split_kind,
+        "expected_total": expected_total,
+        "children": {condition_id_for_task(sales_from, sales_to, industry, task): None for task in child_tasks},
+        "delta": None,
+        "rescue_enqueued": False,
+        "rescue_task": rescue_task,
+    }
+
+
+def complete_split_audit_child(
+    state: Dict[str, Any],
+    parent_condition_id: str,
+    child_condition_id: str,
+    child_total: Optional[int],
+    logger: logging.Logger,
+) -> Optional[Dict[str, Any]]:
+    init_audits(state)
+    entry = state["audits"]["entries"].get(parent_condition_id)
+    if not entry:
+        return None
+    entry["children"][child_condition_id] = child_total
+    if any(total is None for total in entry["children"].values()):
+        return None
+
+    child_sum = sum(total or 0 for total in entry["children"].values())
+    delta = int(entry["expected_total"]) - child_sum
+    entry["delta"] = delta
+    if delta != 0:
+        logger.warning(
+            "split audit mismatch split_kind=%s parent_total=%s child_sum=%s delta=%s condition=%s",
+            entry["split_kind"],
+            entry["expected_total"],
+            child_sum,
+            delta,
+            parent_condition_id,
+        )
+    if delta > 0 and not entry.get("rescue_enqueued") and entry.get("rescue_task"):
+        entry["rescue_enqueued"] = True
+        logger.warning(
+            "enqueue rescue task split_kind=%s delta=%s condition=%s",
+            entry["split_kind"],
+            delta,
+            parent_condition_id,
+        )
+        return dict(entry["rescue_task"])
+    return None
+
+
+def log_split_audit_summary(state: Dict[str, Any], logger: logging.Logger) -> None:
+    init_audits(state)
+    entries = state["audits"]["entries"].items()
+    mismatches = [(condition_id, entry) for condition_id, entry in entries if entry.get("delta")]
+    logger.info("split audit summary mismatches=%s", len(mismatches))
+    for condition_id, entry in mismatches:
+        child_sum = sum(total or 0 for total in entry["children"].values())
+        logger.warning(
+            "split audit summary split_kind=%s parent_total=%s child_sum=%s delta=%s rescue_enqueued=%s condition=%s",
+            entry["split_kind"],
+            entry["expected_total"],
+            child_sum,
+            entry["delta"],
+            entry.get("rescue_enqueued", False),
+            condition_id,
+        )
 
 
 def set_cursor_state(state: Dict[str, Any], sales_index: int, industry_index: int, page: int) -> None:
@@ -1221,6 +1330,7 @@ def run(args: argparse.Namespace) -> int:
         "updated_at": now_iso(),
         "last_error": None,
         "split_context": None,
+        "audits": {"entries": {}},
     }
 
     if args.resume:
@@ -1228,6 +1338,7 @@ def run(args: argparse.Namespace) -> int:
         if loaded:
             state = loaded
             logger.info("resume enabled; restored state from %s", state_path)
+    init_audits(state)
 
     if args.cursor_sales_index is not None or args.cursor_industry_index is not None or args.cursor_page is not None:
         set_cursor_state(
@@ -1310,6 +1421,7 @@ def run(args: argparse.Namespace) -> int:
                         current_task.get("employee_from"),
                         current_task.get("employee_to"),
                         current_task.get("location"),
+                        current_task.get("rescue_label"),
                     )
                     persist_current_task(state, si, ii, page, current_task, task_queue)
                     state_store.save(state)
@@ -1485,14 +1597,34 @@ def run(args: argparse.Namespace) -> int:
                     retry_call(open_and_search, args.retries, logger, "search setup")
 
                     total_count = search_context.get("total_count")
-                    if page == 1 and total_count is not None and total_count > args.split_threshold:
+                    if (
+                        page == 1
+                        and total_count is not None
+                        and total_count > args.split_threshold
+                        and current_task.get("split_level") not in ("employee_rescue", "prefecture_rescue")
+                    ):
                         if (
                             current_task.get("split_level") == "base"
                             and not current_task.get("employee_from")
                             and not current_task.get("employee_to")
                             and not current_task.get("location")
                         ):
-                            split_tasks = build_split_tasks_for_employee()
+                            split_tasks = build_split_tasks_for_employee(condition_id)
+                            rescue_task = make_split_task(
+                                split_level="employee_rescue",
+                                rescue_label="従業員数未設定候補",
+                            )
+                            register_split_audit(
+                                state,
+                                sales_from,
+                                sales_to,
+                                industry,
+                                condition_id,
+                                "employee",
+                                total_count,
+                                split_tasks,
+                                rescue_task=rescue_task,
+                            )
                             logger.info(
                                 "auto split by employee count total_count=%s threshold=%s condition=%s subtasks=%s",
                                 total_count,
@@ -1505,7 +1637,24 @@ def run(args: argparse.Namespace) -> int:
                             state_store.save(state)
                             continue
                         if current_task.get("split_level") in ("employee", "manual") and not current_task.get("location"):
-                            split_tasks = build_split_tasks_for_prefecture(current_task)
+                            split_tasks = build_split_tasks_for_prefecture(current_task, condition_id)
+                            rescue_task = make_split_task(
+                                employee_from=current_task.get("employee_from"),
+                                employee_to=current_task.get("employee_to"),
+                                split_level="prefecture_rescue",
+                                rescue_label="住所未設定候補",
+                            )
+                            register_split_audit(
+                                state,
+                                sales_from,
+                                sales_to,
+                                industry,
+                                condition_id,
+                                "prefecture",
+                                total_count,
+                                split_tasks,
+                                rescue_task=rescue_task,
+                            )
                             logger.info(
                                 "auto split by prefecture total_count=%s threshold=%s condition=%s subtasks=%s",
                                 total_count,
@@ -1591,6 +1740,17 @@ def run(args: argparse.Namespace) -> int:
                             logger.warning("next page transition failed at condition=%s page=%s: %s", condition_id, page, e)
                             break
 
+                    rescue_task = None
+                    if current_task.get("parent_condition_id") and search_context.get("total_count") is not None:
+                        rescue_task = complete_split_audit_child(
+                            state,
+                            current_task["parent_condition_id"],
+                            condition_id,
+                            search_context.get("total_count"),
+                            logger,
+                        )
+                    if rescue_task:
+                        task_queue = [rescue_task] + task_queue
                     set_split_context(state, si, ii, task_queue)
                     state_store.save(state)
 
@@ -1601,6 +1761,7 @@ def run(args: argparse.Namespace) -> int:
 
         state["status"] = "completed"
         state_store.save(state)
+        log_split_audit_summary(state, logger)
         logger.info("completed rows_written=%s", state["stats"]["rows_written"])
         return 0
 
